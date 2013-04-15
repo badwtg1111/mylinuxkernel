@@ -1,0 +1,958 @@
+#include <linux/module.h>   
+#include <linux/kernel.h>   
+#include <linux/init.h>   
+#include <linux/delay.h>
+#include <linux/irq.h>
+#include <linux/fs.h>
+#include <linux/io.h>
+#include <linux/pci.h>
+#include <linux/ioctl.h>
+#include <linux/timer.h>
+#include <linux/slab.h>   
+#include <linux/console.h>   
+#include <linux/miscdevice.h>
+#include <linux/interrupt.h>
+#include <linux/serial.h>   
+#include <linux/serial_core.h>   
+#include <linux/serial_reg.h> 
+#include <linux/platform_device.h>
+#include <plat/regs-gpio.h>
+#include <plat/gpio-cfg.h>
+#include <plat/regs-irqtype.h>
+#include <plat/cpu.h>
+#include <plat/irqs.h>
+#include <plat/gpio-bank-c.h>
+#include <plat/gpio-bank-k.h>
+#include <plat/gpio-bank-l.h>
+#include <plat/gpio-bank-n.h>
+#include <asm/io.h>   
+#include <asm/irq.h>   
+#include <asm/uaccess.h>
+#include <asm/hardware/vic.h>
+#include <mach/map.h>
+#include <mach/gpio.h>
+
+#include "serial_gm8142.h"
+
+static int count;
+static int a[4],c[4];
+
+static void __iomem	 *base_addr0;
+static void __iomem	 *base_addr1;
+static void __iomem	 *base_addr2;
+
+#define SPI_PCLK    (*(volatile unsigned long *)(base_addr0 + 0x00))
+#define SPI_SCLK    (*(volatile unsigned long *)(base_addr1 + 0x00))
+
+#define CH_CFG      (*(volatile unsigned long *)(base_addr2 + 0x00))
+#define CLK_CFG     (*(volatile unsigned long *)(base_addr2 + 0x04))
+#define MODE_CFG    (*(volatile unsigned long *)(base_addr2 + 0x08))
+#define SLAVE_SEL   (*(volatile unsigned long *)(base_addr2 + 0x0c))
+#define SPI_INT_EN  (*(volatile unsigned long *)(base_addr2 + 0x10))
+#define SPI_STATUS  (*(volatile unsigned long *)(base_addr2 + 0x14))
+#define SPI_TX_DATA (*(volatile unsigned long *)(base_addr2 + 0x18))
+#define SPI_RX_DATA (*(volatile unsigned long *)(base_addr2 + 0x1c))
+#define PACKET_CNT  (*(volatile unsigned long *)(base_addr2 + 0x20))
+#define PACKET_CLR  (*(volatile unsigned long *)(base_addr2 + 0x24))
+#define SWAP_CONFIG (*(volatile unsigned long *)(base_addr2 + 0x28))
+#define FB_CLK_SEL  (*(volatile unsigned long *)(base_addr2 + 0x2c))
+
+#define SPI_TXRX_ON       	(CH_CFG |=  0x3)
+#define SPI_TXRX_OFF      	(CH_CFG &= ~0x3)
+#define SPI_CS_LOW        	(SLAVE_SEL &= ~0x01)
+#define SPI_CS_HIGH       	(SLAVE_SEL |=  0x01)
+#define SPI_TX_DONE			(((SPI_STATUS >> 21) & 0x1) == 0x1)
+#define SPI_RX_FIFO_LVL		((SPI_STATUS  >> 13) & 0x7f)
+
+#define IRQ_GM814X 			IRQ_EINT(4)
+#define NR_PORTS 			4
+#define PORT_GM814X			77
+#define GM814X_MAJOR		244
+#define GM814X_MINOR_START 	0
+
+//#define _DEBUG_GM814X
+
+static void gm814x_tx_chars(struct uart_port *port);
+static struct uart_port gm814x_ports[NR_PORTS];
+
+static struct uart_driver gm814x_reg = {
+	.owner			= THIS_MODULE,			//拥有该uart_driver的模块,一般为THIS_MODULE
+	.driver_name	= "serial_gm814x",		//串口驱动程序的名称
+	.dev_name		= "ttyGM",				//串口驱动程序的设备名称
+	.major			= GM814X_MAJOR,			//主设备号
+	.minor			= GM814X_MINOR_START,	//次设备的开始号码
+	.nr				= NR_PORTS,				//串口的数量
+	.cons			= NULL,					//console的相关操作结构体地址，如果不做console，设置为null
+};
+
+static unsigned int g_spi_recv_delay= 50;
+static unsigned int g_spi_send_delay[4] = {64};
+
+void Delay(unsigned int nTime)
+{
+	while(--nTime) {;}
+}
+
+static int spi_ioremap(void)
+{
+#ifdef _DEBUG_GM814X
+		printk(KERN_INFO "1-----spi_ioremap\n");
+#endif
+
+	if((base_addr0 = ioremap(S3C6410_PCLK, 0x04)) == NULL){
+        printk(KERN_ERR "base_addr0 ioremap failed\n");
+        return -ENOMEM;
+    }
+    
+	if((base_addr1 = ioremap(S3C6410_SCLK, 0x04)) == NULL){
+       	printk(KERN_ERR "base_addr1 ioremap failed\n");
+        return -ENOMEM;
+    }
+    
+	if((base_addr2 = ioremap(S3C6410_SPI, 0x30)) == NULL){
+       	printk(KERN_ERR "base_addr3 ioremap failed\n");
+        return -ENOMEM;
+    }
+
+    return 0;
+}
+
+static void write_byte(u8 data)
+{
+	SPI_TX_DATA = data;
+
+	while(!SPI_TX_DONE);
+}
+
+static u8 read_byte(void)
+{
+	u8 ch = 0;
+
+	ch = (u8)SPI_RX_DATA;
+
+	return ch;
+}
+
+/*
+ * spi复位，复位以后寄存器都要重新配置
+ * */
+static void spi_reset(void)
+{
+#ifdef _DEBUG_GM814X
+		printk(KERN_INFO "2.3----spi_reset\n");
+#endif
+	//带有时钟延时的复位
+	CH_CFG &= ~(0x3f);		// 	clear register
+	CH_CFG |= (1 << 5);		//	software reset
+	mdelay(0xff);
+	CH_CFG &= ~(1 << 5);	//	software reset
+}
+
+/*
+ * gpio 设置,配置GPIO功能
+ * */
+static void gpio_select(void)
+{
+#ifdef _DEBUG_GM814X
+		printk(KERN_INFO "2.1-----gpio_select\n");
+#endif
+	//SPI0
+	s3c_gpio_cfgpin(S3C64XX_GPC(0), S3C64XX_GPC0_SPI_MISO0);
+	s3c_gpio_cfgpin(S3C64XX_GPC(1), S3C64XX_GPC1_SPI_CLK0);
+	s3c_gpio_cfgpin(S3C64XX_GPC(2), S3C64XX_GPC2_SPI_MOSI0);
+	s3c_gpio_cfgpin(S3C64XX_GPC(3), S3C64XX_GPC3_SPI_nCS0);
+
+	s3c_gpio_setpull(S3C64XX_GPC(0), S3C_GPIO_PULL_NONE);
+	s3c_gpio_setpull(S3C64XX_GPC(1), S3C_GPIO_PULL_NONE);
+	s3c_gpio_setpull(S3C64XX_GPC(2), S3C_GPIO_PULL_NONE);
+	s3c_gpio_setpull(S3C64XX_GPC(3), S3C_GPIO_PULL_NONE);
+
+	//GPL13 SET ----GM8142_RST--------new6410
+	if( (gpio_request(S3C64XX_GPL(13), "GPL13_RST") == 0) &&
+		(gpio_direction_output(S3C64XX_GPL(13), 1) == 0))
+	{
+		gpio_export(S3C64XX_GPL(13), 0); 			
+		gpio_set_value(S3C64XX_GPL(13), 0);			//RST LOW
+		udelay(400);
+		gpio_set_value(S3C64XX_GPL(13), 1);			//RST HIGH
+		udelay(400);
+	}
+	else{
+		printk(KERN_ERR "GM8142: cluld not obtain gpio for 'GPK8_RST'\n");
+	}
+
+    //GPL14 SET----GM8142_SHDN
+	if( (gpio_request(S3C64XX_GPL(14), "GPL14_SHDN") == 0) &&
+		(gpio_direction_output(S3C64XX_GPL(14), 1) == 0))
+	{
+		gpio_export(S3C64XX_GPL(14), 0);	
+		gpio_set_value(S3C64XX_GPL(14), 1);		//SHDN=1，正常工作模式
+		
+		if( gpio_get_value(S3C64XX_GPL(14)) == 0)
+		{
+			printk(KERN_ERR "GM8142: can't set GPL(14) SHDN = 1\n");
+		}
+	}
+	else{
+		printk(KERN_ERR "GM8142: cluld not obtain gpio for 'GPL14_SHDN'\n");
+	}
+	
+	s3c_gpio_cfgpin(S3C64XX_GPN(4), S3C_GPIO_SFN(2));			//配置GPN4为外中断
+	s3c_gpio_setpull(S3C64XX_GPN(4), S3C_GPIO_PULL_NONE);		//不上拉也不下拉，硬件默认拉高
+	//set_irq_type(S3C64XX_GPN(4), IRQ_TYPE_EDGE_BOTH);			//发送和接收数据都会触发
+	set_irq_type(S3C64XX_GPN(4), IRQ_TYPE_LEVEL_LOW);			//低电平触发	
+	//set_irq_type(S3C64XX_GPN(4), IRQ_TYPE_EDGE_FALLING);
+
+}
+
+/*
+ * 使能时钟
+ * */
+static void clock_enable(void)
+{
+#ifdef _DEBUG_GM814X
+		printk(KERN_INFO "2.2----clock_enable\n");
+#endif
+	//SPI0
+	SPI_PCLK |= (0x1<<21);
+	SPI_SCLK |= (0x1<<20);
+}
+
+/*
+ * 清缓冲
+ * */
+static void clear_info(void)
+{
+    int i 	  = 0;
+	int count = 0;
+
+    count = SPI_RX_FIFO_LVL;
+
+    //释放掉无关的数据
+    for(i = 0; i < count; i++)
+    {
+        read_byte();
+    }
+}
+
+/*
+ * 初始化SPI寄存器
+ * */
+static void spi_init(void)
+{
+#ifdef _DEBUG_GM814X
+		printk(KERN_INFO "2-----spi_init------\n");
+#endif
+	
+	gpio_select();
+	clock_enable();
+    spi_reset();
+
+    // 1. SET CH_CFG
+    CH_CFG   	= HIGH_SPEED_EN | SW_RST | MASTER | CPOL | CPHA;
+    // 2. SET CLK_CFG
+    CLK_CFG    &= ~ ( 0x7ff );
+    CLK_CFG  	= SPI_CLKSEL | ENCLK | SPI_SCALER;
+    // 3. SET MODE_CFG
+    MODE_CFG   &= ( u32 ) ( 1 << 31 );
+    MODE_CFG 	= CH_WIDTH | TRAILING_CNT | BUS_WIDTH | RX_RDY_LVL | TX_RDY_LVL | RX_DMA_SW | TX_DMA_SW | DMA_TYPE;
+    // 4. SET SLAVE_SEL
+    SLAVE_SEL   = SLAVE_CS_HIGH |SLAVE_AUTO_OFF;
+    // 5. SET SPI_INT_EN
+    SPI_INT_EN  = SPI_INT_ENABLE;
+    // 6. SET SWAP_CONFIG
+    SWAP_CONFIG = RX_SWAP_EN | RX_SWAP_MODE | TX_SWAP_EN | TX_SWAP_MODE;
+
+#ifdef _DEBUG_GM814X
+		printk(KERN_INFO "2------spi_init end---------\n");
+#endif
+}
+
+/*
+ * free spi register ioremap
+ * */
+static void spi_release(void)
+{
+#ifdef _DEBUG_GM814X
+		printk(KERN_INFO "spi_release\n");
+#endif
+	iounmap(base_addr0);
+    iounmap(base_addr1);
+    iounmap(base_addr2);
+}
+
+/*
+ * spi write data
+ * Input:    hign: 	hign 8 bit data
+ *	 	 	 low:	low 8 bit data
+ * Output:   read u16 data
+ * */
+static u16 spi_send16(u8 hign, u8 low)
+{
+    u32 	i = 0;
+    u8 		save_data = 0;
+    u32	 	count = 0;
+    u16 	data = 0;
+	u8		line;
+	
+	SPI_TXRX_ON;
+	SPI_CS_LOW;
+	Delay(5);		//延时时间参考814x数据手册的要求
+
+    clear_info();
+    write_byte(hign);	
+	
+	udelay(10);
+
+    write_byte(low);
+	if ((hign & 0xc0) == 0x80)
+	{
+		line = (hign >> 3) & 0x03;
+		udelay(g_spi_send_delay[line]);
+	}
+	else
+	{
+		udelay(15);
+		//udelay(g_spi_recv_delay);
+	}
+
+
+    count = SPI_RX_FIFO_LVL;
+
+    if(count == 2)
+    {
+        for(i = 0; i < 2; i++)
+        {
+            save_data = read_byte();
+            data = (data << 8) + (u16)save_data;
+        }
+    }
+    else
+    {
+        data = 0;
+    }
+	
+    SPI_CS_HIGH;
+    SPI_TXRX_OFF;	
+
+    Delay(10);  //延时时间参考814x数据手册的要求
+
+    return data;
+}
+
+/*
+ * 向指定的串口功能设置寄存器写配置
+ * Input:    port:	表示设置的串口号
+ *	 	 	 high:	表示给配置寄存器的高位字节(低三位有效)
+ *	 	 	 low:	low表示给配置寄存器的低位字节
+ * Output:   revdata: 2 byte read from 814x
+ * */
+u16 gm814x_write_reg(u8 port, u8 high, u8 low)
+{
+	u8 		ch;
+	u16 	revdata;
+	
+	high 	= high & 0x07;
+	ch 		= 0xc0 | (port << 3);
+	high 	= high | ch;
+	revdata = spi_send16(high,low);
+	udelay(10);
+	
+	return revdata;
+}
+
+/*
+ * 读出指定串口的功能设置寄存器内容
+ * Input:    port:	表示设置的串口号
+ *	 	 	 high:	表示给配置寄存器的高位字节(低三位有效)
+ *	 	 	 low:	low表示给配置寄存器的低位字节
+ * Output:   revdata: 2 byte read from 814x
+ * */
+u16 gm814x_read_reg(u8 port, u8 high, u8 low)
+{
+	u16 	revdata;
+	u8 		ch;
+	
+	high 	= high & 0x07;
+	ch 		= 0x40 | (port << 3);
+	high 	= high | ch;
+	revdata = spi_send16(high, low);
+	
+	return revdata;
+}
+
+/*
+ * 同时读出所有发送FIFO状态
+ * */
+u16 gm814x_read_fifo_status(void)
+{
+	u16 revdata;
+	
+	revdata	= spi_send16(0x60, 0x00);
+	
+	return revdata;
+}
+
+/*
+ * 同时读出所有发送FIFO数据
+ * */
+u16 gm814x_read_fifo_data(void)
+{
+	u16 revdata;
+	
+	revdata = spi_send16(0x00, 0x00);
+
+#ifdef _DEBUG_GM814X
+		//printk(KERN_INFO"gm814x_read_fifo_data:0x%x\n", revdata);
+#endif
+	
+	return revdata;
+}
+
+/*
+ * 向指定串口FIFO发送数据
+ * Input: 	port:	serial number
+ *			c:		send data
+ * */
+u16 gm814x_send_char(u8 port, u8 c)
+{
+	u8 ch;
+	u16 revdata;
+	
+	ch = 0x80;
+	ch = ch | (port << 3);
+	revdata = spi_send16(ch, c);
+
+#ifdef _DEBUG_GM814X
+		printk(KERN_INFO "gm814x_send_char:0x%x\n", revdata);
+#endif
+	
+	return revdata;
+}
+
+static void gm814x_stop_tx(struct uart_port *port)
+{
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "gm814x_stop_tx \n");
+#endif
+	//GM814X clean irq by read fifo data
+	gm814x_read_fifo_data();
+
+}
+
+/*
+ * 开始发送端口中的数据.
+ */
+static void gm814x_start_tx(struct uart_port *port)
+{
+#ifdef _DEBUG_GM814X
+	//printk(KERN_INFO "gm814x_start_tx:%d\n", port->line);
+#endif
+	gm814x_tx_chars(port);
+}
+
+static void gm814x_stop_rx(struct uart_port *port)
+{
+#ifdef _DEBUG_GM814X
+		printk(KERN_INFO "gm814x_stop_rx\n");
+#endif
+}
+
+static void gm814x_enable_ms(struct uart_port *port)
+{
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "gm814x_enable_ms\n");
+#endif
+}
+
+/* This just initial proto */
+static void
+gm814x_rx_chars(int c[4])
+{
+#ifdef _DEBUG_GM814X
+	printk("gm814x_rx_chars\n");
+#endif
+	uint16_t  rxdata,rxstatus;
+	uint8_t ch;
+	int tmp;
+#ifdef _DEBUG_GM814X
+	int i;
+#endif
+	uint32_t flag;
+	
+	rxdata = gm814x_read_fifo_data();
+	tmp=(rxdata>>12) & 0x03;
+#ifdef _DEBUG_GM814X
+	printk("NOW recevie port:%d,rxdata:%04x,count:%d\n",tmp,rxdata,count);
+	
+	for(i=0;i<4;i++)
+	
+	printk("rx c[%d]=%d\n",i,c[i]);
+				
+#endif	
+	struct uart_port *port= &gm814x_ports[tmp];
+	struct tty_struct *tty = port->info->port.tty;
+#ifdef _DEBUG_GM814X
+	printk("OK the receive port 12~13:%d , rxdata :%04x\n",rxdata>>12 & 0x03,rxdata);
+#endif
+	ch = rxdata & 0x00ff;//得到一个字符的数据
+
+	port->icount.rx++;
+	flag = TTY_NORMAL;
+
+	if (uart_handle_sysrq_char(port, ch))
+		goto ignore_char;
+	tty_insert_flip_char(tty, ch, flag);//XXX
+ignore_char:
+	rxstatus=gm814x_read_fifo_status();//得到更新的状态
+#ifdef _DEBUG_GM814X
+	printk("rxstatus fifo :%04x\n",rxstatus);
+#endif
+
+	tty_flip_buffer_push(tty);
+	
+	return;
+}
+
+/* This just initial proto */
+static void gm814x_tx_chars(struct uart_port *port)
+{
+#ifdef _DEBUG_GM814X
+	printk("gm814x_tx_chars\n");
+#endif
+	struct circ_buf* xmit = &port->info->xmit;
+	struct tty_struct *tty = port->info->port.tty;
+	uint16_t txstatus;
+	if (port->x_char) {
+		//向FIFO写入一个数据
+		gm814x_send_char(port->line,port->x_char);
+#ifdef _DEBUG_GM814X
+		 printk("TX_CHARS:111111111\n");
+#endif
+		port->icount.tx++;
+		port->x_char = 0;
+		return;
+	}
+	if (xmit->head == xmit->tail
+	    || tty->stopped
+	    || tty->hw_stopped) {
+#ifdef _DEBUG_GM814X
+		printk("TX_CHARS:222222222\n");
+#endif
+		gm814x_stop_tx(port);
+		return;
+	}
+	txstatus=gm814x_read_fifo_status();
+	
+	while ((txstatus & (1<<port->line))){//发送FIFO为空则继续发
+#ifdef _DEBUG_GM814X
+		printk("put %d: %c\n", port->icount.tx, xmit->buf[xmit->tail]);
+		printk("TX_CHARS:333333333333\n");
+#endif
+		gm814x_send_char(port->line, xmit->buf[xmit->tail]);
+		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
+		port->icount.tx++;
+		if (uart_circ_empty(xmit))
+			break;
+	 	txstatus=gm814x_read_fifo_status();
+	 	
+	}
+	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
+		uart_write_wakeup(port);
+
+	if (uart_circ_empty(xmit))
+		gm814x_stop_tx(port);
+
+}
+
+
+
+static irqreturn_t gm814x_int(int irq, void *dev_id)
+{
+	struct uart_port *port = dev_id;
+	uint16_t gir;
+	int i,b=0,n=0;
+	count=0;
+//	spin_lock(&port->lock);
+#ifdef _DEBUG_GM814X
+	printk("\ngm814x_int irq\n");	
+#endif
+	
+        for(i=0,n=0;i<4;i++){
+		if(a[i]!=0){
+		c[n++]=a[i];
+		b++;
+		}                 //数组C用于记录当前那些串口被打开
+				
+	}
+	count=b;  //count用于记录被打开的串口的总数
+#ifdef _DEBUG_GM814X
+	for(i=0;i<4;i++)
+		printk("a[%d]:%d,c[%d]:%d ,count:%d\n",i,a[i],i,c[i],count);
+#endif
+
+	
+	gir = gm814x_read_fifo_status();
+	if(gir & 0x8000)		//接收中断处理
+	{
+		gm814x_rx_chars(c);
+	}
+	else if(gir & 0x4000)	//发送中断处理
+	{
+		gm814x_tx_chars(port);
+	}
+	else
+	{
+		return IRQ_NONE;
+	}
+
+//	spin_unlock(&port->lock);
+	return IRQ_HANDLED;
+}
+
+/*
+ * 判断是否发送已经完成.
+ */
+static u32 gm814x_tx_empty(struct uart_port *port)
+{
+	u16	ssr;
+
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "gm814x_tx_empty\n");
+#endif
+
+	ssr  = gm814x_read_fifo_status();
+	ssr &= 1 << (port->line);
+
+	return ssr ? TIOCSER_TEMT : 0;
+}
+
+static u32 gm814x_get_mctrl(struct uart_port *port)
+{
+
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "gm814x_get_mctrl\n");
+#endif
+
+	return TIOCM_CTS | TIOCM_DSR | TIOCM_CAR;
+}
+
+static void gm814x_set_mctrl(struct uart_port *port, unsigned int mctrl)
+{
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "gm814x_set_mctrl\n");
+#endif
+}
+
+static void gm814x_break_ctl(struct uart_port *port, int break_state)
+{
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "gm814x_break_ctl\n");
+#endif
+}
+
+/*
+ * 串口打开函数,设置串口波特率，注册相关中断.
+ * gm814x_read_fifo_data();
+ * 清中断，芯片初始化之前IRQ引脚为高电平，若为低电平，必须先置高电平。
+ */
+static int gm814x_startup(struct uart_port *port)
+{
+	u16 ret;
+	int retval = 0;
+	struct tty_struct *tty = port->info->port.tty;
+
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "gm814x_startup, serial number is:%d\n", port->line);
+#endif
+
+	// SHDN=0, PS1/PS0=port->line, PM=0, PEM=0, TM=0(tx end irq), IR=0,L=0, P1=P0=0, B3/B2/B1/B0=0100(9600)
+	
+	if(port->line == 0)				//ttyGM0 9600 Baud，8位数据位，一位起始停止位，无校验
+	{
+		retval = request_irq(port->irq, gm814x_int, IRQF_SHARED, "ttyGM0", port);
+		if(retval==0){
+			a[0]=1; 
+		 }	
+	}
+	else if(port->line == 1)		//ttyGM1 4800 Baud，8位数据位，一位起始停止位，无校验
+	{
+		retval = request_irq(port->irq, gm814x_int, IRQF_SHARED, "ttyGM1", port);
+		if(retval==0){
+			a[1]=2; 
+		 }	
+	}
+	else if(port->line == 2)		//ttyGM2 1200 Baud，8位数据位，一位起始停止位，无校验
+	{
+      	retval = request_irq(port->irq, gm814x_int, IRQF_SHARED, "ttyGM2", port);
+		if(retval==0){
+			a[2]=3; 
+		 }	
+	}
+	else if(port->line == 3)		//ttyGM3 115200 Baud，8位数据位，一位起始停止位，无校验
+	{
+		retval = request_irq(port->irq, gm814x_int, IRQF_SHARED, "ttyGM3", port);
+		if(retval==0){
+			a[3]=4; 
+		 }	
+	}
+   	
+	if (retval)
+	{
+		printk(KERN_ERR "cannot get irq %d\n", port->irq);
+		return retval;
+	}
+	
+	tty->real_raw = 1;
+	tty->icanon = 0;
+
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "gm814x_startup exit\n");
+#endif
+
+	return 0;
+}
+
+/*
+ * serial shutdown and exit.
+ */
+static void gm814x_shutdown(struct uart_port *port)
+{
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "gm814x_shutdown\n");
+	printk(KERN_INFO "close serial number :%d, clear irq\n", port->line);
+#endif
+	//Free the interrupt
+	free_irq(port->irq, port);
+}
+
+static void gm814x_set_termios(struct uart_port *port, struct ktermios *termios, struct ktermios *old)
+{
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "gm814x_set_termios\n");
+#endif
+	unsigned int baudi, baudo, baud;
+
+	/*
+	 * We don't support modem control lines.
+	 */
+	termios->c_cflag &= ~(HUPCL | CRTSCTS | CMSPAR);
+	termios->c_cflag |= CLOCAL;
+	 
+	/*
+	 * We don't support BREAK character recognition.
+	 */
+	termios->c_iflag &= ~(IGNBRK | BRKINT);
+	termios->c_cc[VMIN] = 1;
+	termios->c_cc[VTIME] = 0;
+
+	baudi = termios->c_ispeed;
+	baudo = termios->c_ospeed;
+	baud = (baudi >= baudo) ? baudi : baudo;
+#ifdef _DEBUG_GM814X
+				printk(KERN_INFO "baud = %d\n", baud);
+#endif
+	switch(baud)
+	{
+		case 115200:
+			g_spi_send_delay[port->line] = 90;
+			gm814x_write_reg(port->line, 0x00, GM_8142_B115200);
+			udelay(9);		//��Ӧ���ڲ��������ú����²�����1bitʱ������Ч
+			break;
+		case 57600:			
+			g_spi_send_delay[port->line] = 180;
+			gm814x_write_reg(port->line, 0x00, GM_8142_B57600);
+			udelay(18);
+			break;
+		case 9600:
+			g_spi_send_delay[port->line] = 1350;
+			gm814x_write_reg(port->line, 0x00, GM_8142_B9600);
+			udelay(105);
+			break;
+		case 4800:
+			g_spi_send_delay[port->line] = 2775;
+			gm814x_write_reg(port->line, 0x00, GM_8142_B4800);
+			udelay(210);
+			break;
+		default:
+			g_spi_send_delay[port->line] = 90;
+			gm814x_write_reg(port->line, 0x00, GM_8142_B115200);
+			udelay(9);
+	}
+}
+
+static const char *gm814x_type(struct uart_port *port)
+{
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "gm814x_type\n");
+#endif
+	return port->type == PORT_GM814X ? "GM814X" : NULL;
+}
+
+/*
+ * Release the memory region(s) being used by 'port'
+ */
+static void gm814x_release_port(struct uart_port *port)
+{
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "gm814x_release_port\n");
+#endif
+}
+
+/*
+ * Request the memory region(s) being used by 'port'
+ */
+static int gm814x_request_port(struct uart_port *port)
+{
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "gm814x_request_port\n");
+#endif
+
+	return 0;
+}
+
+/*
+ * Configure/autoconfigure the port.
+ */
+static void gm814x_config_port(struct uart_port *port, int flags)
+{
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "gm814x_config_port,flags:%d\n",flags);
+#endif
+
+	if (flags & UART_CONFIG_TYPE && gm814x_request_port(port) == 0)
+	{
+		port->type = PORT_GM814X;
+	}
+}
+
+/*
+ * verify the new serial_struct (for GM8142SERIAL).
+ */
+static int gm814x_verify_port(struct uart_port *port, struct serial_struct *ser)
+{
+	int ret = 0;
+
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "gm814x_verify_port\n");
+#endif
+
+	if (ser->type != PORT_UNKNOWN && ser->type != PORT_GM814X)
+			ret = -EINVAL;
+	if(port->irq != ser->irq)
+			ret = -EINVAL;
+	if (ser->io_type != SERIAL_IO_PORT)
+			ret = -EINVAL;
+	if (port->iobase != ser->port)
+			ret = -EINVAL;
+	if (ser->hub6 != 0)
+			ret = -EINVAL;
+	
+	return ret;
+}
+
+static struct uart_ops gm814x_pops = {
+	.tx_empty		= gm814x_tx_empty,		//串口的Tx FIFO缓存是否为空
+	.set_mctrl		= gm814x_set_mctrl,		//设置串口modem控制
+	.get_mctrl		= gm814x_get_mctrl,		//获取串口modem控制
+	.stop_tx		= gm814x_stop_tx,		//禁止串口发送数据
+	.start_tx		= gm814x_start_tx,		//使能串口发送数据
+	.stop_rx		= gm814x_stop_rx,		//禁止串口接收数据
+	.enable_ms		= gm814x_enable_ms,		//使能modem的状态信号
+	.break_ctl		= gm814x_break_ctl,		//设置break信号
+	.startup		= gm814x_startup,		//启动串口,应用程序打开串口设备文件时,该函数会被调用
+	.shutdown		= gm814x_shutdown,		//关闭串口,应用程序关闭串口设备文件时,该函数会被调用
+	.set_termios	= gm814x_set_termios,	//设置串口参数
+	.type			= gm814x_type,			//返回一描述串口类型的字符串
+	.release_port	= gm814x_release_port,	//释放串口已申请的IO端口/IO内存资源,必要时还需iounmap
+	.request_port	= gm814x_request_port,	//申请必要的IO端口/IO内存资源,必要时还可以重新映射串口端口
+	.config_port	= gm814x_config_port,	//执行串口所需的自动配置
+	.verify_port	= gm814x_verify_port,	//核实新串口的信息
+};
+
+
+/*
+ * 初始化uart_port结构体和调用uart_add_one_port()添加端口
+ * */
+static void gm814x_init_ports(void)
+{
+	int i;
+	static int 	first = 1;
+	struct uart_port *port;
+	
+#ifdef _DEBUG_GM814X
+	printk(KERN_INFO "Initialize the serial port, init ports ,uart_add_one_port\n");
+#endif
+
+	if (!first)
+		return;
+	
+	first = 0;
+
+	for (i = 0; i < NR_PORTS; i++)
+	{
+		port 			= &gm814x_ports[i];
+		port->uartclk  	= 3686400;								//时钟为3.6864MHz
+		port->ops      	= &gm814x_pops;							//串口端口操作函数集
+		port->fifosize 	= 16;									//fifosize 16
+		port->iobase  	= (i + 1) * 1024;						//各端口地址映射后的地址
+		port->irq     	= IRQ_GM814X;							//中断号115，也就是外部中断4
+		port->iotype  	= UPIO_PORT;							//IO访问方式, IO端口
+		port->flags   	= UPF_BOOT_AUTOCONF | UPF_SHARE_IRQ;	//共享中断
+		port->line    	= i;									//端口的号码，从0开始
+
+		uart_add_one_port (&gm814x_reg, &gm814x_ports[i]);		//添加端口
+	}
+}
+
+/*
+ * 模块初始化相关函数
+ * */
+static int __init gm814x_serial_init(void)
+{
+	int ret;
+
+	spi_ioremap();					//ioremap
+	
+	//将串口驱动uart_driver注册到内核(串口核心层)中
+	ret = uart_register_driver(&gm814x_reg);
+	if(ret){
+		printk(KERN_ERR "Failed to register UART driver\n");
+		return -1;
+	}
+	
+	spi_init();						//spi 初始化
+	gm814x_init_ports();			//串口初始化
+	
+	printk(KERN_INFO "Initialize the gm8142 serial driver\n");
+
+	return ret;
+}
+
+static void __exit gm814x_serial_exit(void)
+{
+	int i;
+	int ret;
+		
+	for (i = 0; i < NR_PORTS; i++)
+	{	//删除一个已添加到串口驱动中的串口端口
+		ret = uart_remove_one_port (&gm814x_reg, &gm814x_ports[i]);
+		if(ret != 0)
+		{
+			printk(KERN_ERR "Failed to remove one port\n");
+			return ;
+		}
+	}
+	//注销已注册的uart_driver
+	uart_unregister_driver(&gm814x_reg);
+	spi_release();
+
+	printk(KERN_INFO "Exit the gm8142 serial driver\n");
+}
+
+module_init(gm814x_serial_init);
+module_exit(gm814x_serial_exit);
+
+MODULE_AUTHOR("handaer");
+MODULE_DESCRIPTION("gm8142 serial port driver");
+MODULE_LICENSE("GPL");
