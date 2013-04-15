@@ -339,6 +339,7 @@ static int s3c6400_ac97_hw_params(struct snd_pcm_substream *substream,
 
 static int s3c6400_ac97_hifi_prepare(struct snd_pcm_substream *substream)
 {
+	unsigned short val = 0;
 	/*
 	 * To support full duplex  
 	 * Tested by cat /dev/dsp > /dev/dsp
@@ -382,23 +383,37 @@ static int s3c6400_ac97_hifi_prepare(struct snd_pcm_substream *substream)
 			XX1111: +22.5dB 
 		*/
 		//s3c6400_ac97_write(0, 0x12, 0x0f0f);
-		s3c6400_ac97_write(0, 0x12, 0x0f0f);	//add by Johnny ,for 0x7878  pad end can listen echo voice a lot loud
+		//s3c6400_ac97_write(0, 0x12, 0x0f0f);	//add by Johnny ,for 0x7878  pad end can listen echo voice a lot loud
+		val = (0x0f0f & ~(0x1 << 14))| (0x1 << 14);//add by chenchunsheng, use GRL extended
+		val = (val & ~(0x3f << 8))| (0x3f << 8);//add by chenchunsheng, set RECVOLL +30dB
+		s3c6400_ac97_write(0, 0x12, val);//add by chenchunsheng
+
+
 #ifdef CONFIG_SOUND_WM9713_INPUT_STREAM_MIC
 		s3c6400_ac97_write(0, 0x5c, 0x2);
 		//s3c6400_ac97_write(0, 0x10, 0x68);
 		//default MICA is only enabled.
-		s3c6400_ac97_write(0, 0x10, 0xdf);	//add by liuqian ,mute MICA and MICB
+		s3c6400_ac97_write(0, 0x10, 0xdf);	//add by liuqian ,mute MICA and MICB to headphone
 		//s3c6400_ac97_write(0, 0x14, 0xfe00);
 		
 		s3c6400_ac97_write(0, 0x16, 0xffff);	//add by liuqian
-		s3c6400_ac97_write(0, 0x22, 0x1f80);	//add bu liuqian
+		
+		//s3c6400_ac97_write(0, 0x22, 0x1f80);	//add bu liuqian
+		val = (0x1f80 & ~(0x11 << 12))| (0x00 << 12); //add by chenchunsheng, select MIC1 at MPASEL
+		s3c6400_ac97_write(0, 0x22, val);//add by chenchunsheng
+ 
+
 		//14h:6
 	    //1: Boost ADC input signal by 20dB 
 	    //0 :No boost 
         // No bootst ,MONOIN
 		//s3c6400_ac97_write(0, 0x14, 0xfe5b);	//add by Johnny    record src is monoin,if want to listen monoin voice from HP,changed 0xfe5b to 0x0e5b
-		s3c6400_ac97_write(0, 0x14, 0x0e1f);	//add by Johnny  open HP listen rec from monoin  record src is monoin
-		
+		//s3c6400_ac97_write(0, 0x14, 0x0e1f);	//add by Johnny  open HP listen rec from monoin  record src is monoin
+
+		val = (0x0e1f & ~(0x111 << 3))| (0x000 << 3);//add by chenchunsheng, left record select MICA
+		val = (val & ~(0x11 << 14))| (0x11 << 14);//add by chenchunsheng, record mux to headphone mute L and R
+		val = (val & ~(0x1 << 6))| (0x1 << 6);//add by chenchunsheng, record boost +20dB
+		s3c6400_ac97_write(0, 0x14, val);
 		//s3c6400_ac97_write(0,0x14,0xfe00);
 		//default L and R record is MICA
 
