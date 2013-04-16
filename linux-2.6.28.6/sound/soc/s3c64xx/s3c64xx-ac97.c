@@ -384,8 +384,8 @@ static int s3c6400_ac97_hifi_prepare(struct snd_pcm_substream *substream)
 		*/
 		//s3c6400_ac97_write(0, 0x12, 0x0f0f);
 		//s3c6400_ac97_write(0, 0x12, 0x0f0f);	//add by Johnny ,for 0x7878  pad end can listen echo voice a lot loud
-		val = (0x0f0f & ~(0x1 << 14))| (0x1 << 14);//add by chenchunsheng, use GRL extended
-		val = (val & ~(0x3f << 8))| (0x3f << 8);//add by chenchunsheng, set RECVOLL +30dB
+		val = (0x0f0f & ~(0x1 << 14))| (0x0 << 14);//add by chenchunsheng, use GRL extended
+		val = (val & ~(0x3f << 8))| (0xf << 8);//add by chenchunsheng, set RECVOLL +30dB
 		s3c6400_ac97_write(0, 0x12, val);//add by chenchunsheng
 
 
@@ -399,7 +399,7 @@ static int s3c6400_ac97_hifi_prepare(struct snd_pcm_substream *substream)
 		s3c6400_ac97_write(0, 0x16, 0xffff);	//add by liuqian
 		
 		//s3c6400_ac97_write(0, 0x22, 0x1f80);	//add bu liuqian
-		val = (0x1f80 & ~(0x11 << 12))| (0x00 << 12); //add by chenchunsheng, select MIC1 at MPASEL
+		val = (0x1f80 & ~(0x3 << 12))| (0x0 << 12); //add by chenchunsheng, select MIC1 at MPASEL
 		s3c6400_ac97_write(0, 0x22, val);//add by chenchunsheng
  
 
@@ -410,9 +410,9 @@ static int s3c6400_ac97_hifi_prepare(struct snd_pcm_substream *substream)
 		//s3c6400_ac97_write(0, 0x14, 0xfe5b);	//add by Johnny    record src is monoin,if want to listen monoin voice from HP,changed 0xfe5b to 0x0e5b
 		//s3c6400_ac97_write(0, 0x14, 0x0e1f);	//add by Johnny  open HP listen rec from monoin  record src is monoin
 
-		val = (0x0e1f & ~(0x111 << 3))| (0x000 << 3);//add by chenchunsheng, left record select MICA
-		val = (val & ~(0x11 << 14))| (0x11 << 14);//add by chenchunsheng, record mux to headphone mute L and R
-		val = (val & ~(0x1 << 6))| (0x1 << 6);//add by chenchunsheng, record boost +20dB
+		val = (0x0e1f & ~(0x7 << 3))| (0x0 << 3);//add by chenchunsheng, left record select MICA
+		val = (val & ~(0x3 << 14))| (0x3 << 14);//add by chenchunsheng, record mux to headphone mute L and R
+		val = (val & ~(0x1 << 6))| (0x0 << 6);//add by chenchunsheng, record boost +20dB
 		s3c6400_ac97_write(0, 0x14, val);
 		//s3c6400_ac97_write(0,0x14,0xfe00);
 		//default L and R record is MICA
