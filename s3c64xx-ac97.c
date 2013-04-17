@@ -50,8 +50,9 @@
 //#include "../s3c24xx/s3c-pcm.h"
 #include "s3c-pcm.h"
 #include "s3c64xx-ac97.h"
+//
 
-//#define CONFIG_SND_DEBUG 1
+#define CONFIG_SND_DEBUG 1
 
 #ifdef CONFIG_SND_DEBUG
 #define s3cdbg(x...) printk(x)
@@ -337,17 +338,34 @@ static int s3c6400_ac97_hw_params(struct snd_pcm_substream *substream,
 	return 0;
 }
 
+
+static unsigned short my_update_bits(unsigned short old_val, unsigned short base_bit,
+						unsigned short mask, unsigned short target_bit_val){
+	//val_ctl_mic_routing = 0x68;
+	//val_ctl_mic_routing &= ~(0x3 << 3);
+	//val_ctl_mic_routing |= 0x3 << 3;
+	s3cdbg("Entered %s\n", __FUNCTION__);
+	old_val &= ~( mask << base_bit);
+	old_val |= target_bit_val << base_bit;
+	
+
+	return old_val;
+}
+
+
 static int s3c6400_ac97_hifi_prepare(struct snd_pcm_substream *substream)
 {
+	u16 val_ctl_mic_routing = 0;
 	/*
 	 * To support full duplex  
 	 * Tested by cat /dev/dsp > /dev/dsp
 	 */
 	s3cdbg("Entered %s\n", __FUNCTION__);
+//	printk("Entered %s\n", __FUNCTION__);
 
-	s3c6400_ac97_write(0,0x26,0x0);
-	s3c6400_ac97_write(0, 0x0c, 0x0808);
-	s3c6400_ac97_write(0,0x3c, 0xf803);
+	s3c6400_ac97_write(0,0x26,0x0);// enable output PGAs, Interal Clock, AC-Link, Analogue, Input PGAs and Mixers, Stereo DAC, Stereo ADC and Record mux
+	s3c6400_ac97_write(0, 0x0c, 0x0808);//no mute DAC to headphone,speaker and mono; DACLVOL and DACRVOL 0dB
+	s3c6400_ac97_write(0,0x3c, 0xf803);//enable VREF, PLL, DACL,DACR, ADCL,ADCR,HPLX,HPRX
 	s3c6400_ac97_write(0,0x3e,0xb990);
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
@@ -359,11 +377,20 @@ static int s3c6400_ac97_hifi_prepare(struct snd_pcm_substream *substream)
 	{
 		s3c6400_ac97_write(0, 0x12, 0x0f0f);
 #ifdef CONFIG_SOUND_WM9713_INPUT_STREAM_MIC
-		s3c6400_ac97_write(0,0x5c,0x2);
-		s3c6400_ac97_write(0,0x10,0x68);
-		s3c6400_ac97_write(0,0x14,0xfe00);
+		s3c6400_ac97_write(0,0x5c,0x2);//Slot 6 and Slot 9
+
+		val_ctl_mic_routing = 0x68;// by default, no mute MICA to mono, mute MICB to mono, MIC to headphone mixer MICA only
+		//val_ctl_mic_routing &= ~(0x3 << 3);//clear bit
+		//val_ctl_mic_routing |= 0x3 << 3;//mute MICA and mute MICB to headphone
+
+		val_ctl_mic_routing = my_update_bits(0x68,3,0x3,0x3);
+		
+		s3c6400_ac97_write(0,0x10,val_ctl_mic_routing);
+
+
+		s3c6400_ac97_write(0,0x14,0xfe00);//mute headphone , mute mono and select mic(L and R)
 #else /* Input Stream is LINE-IN */
-		s3c6400_ac97_write(0, 0x14, 0xd612);
+		s3c6400_ac97_write(0, 0x14, 0xd612);//mute headphone , mute mono and select LINEL(L and R)
 #endif
 	}
 
@@ -375,7 +402,22 @@ static int s3c6400_ac97_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	u32 ac_glbctrl;
 
+	
+
+#if 0
+	//add by suxiaozhi 20111124
+	unsigned short temp;
+	unsigned short value;
+
+	for (temp = 0x00; temp <= 0x7e; temp += 0x02)
+	{
+		value = s3c6400_ac97_read(0,temp);
+		printk(KERN_ERR "9714 reg 0x%x value is 0x%x\n", temp, value);
+	}
+	//end of add by suxiaozhi
+#endif
 	s3cdbg("Entered %s: cmd = %d\n", __FUNCTION__, cmd);
+//	printk("Entered %s: cmd = %d\n", __FUNCTION__, cmd);
 
 	ac_glbctrl = readl(s3c24xx_ac97.regs + S3C_AC97_GLBCTRL);
 	switch(cmd) {

@@ -45,6 +45,8 @@
 #define MAIN_DMA_CH 0
 #endif
 
+#define CONFIG_SND_DEBUG
+
 #ifdef CONFIG_SND_DEBUG
 #define s3cdbg(x...) printk(x)
 #else
