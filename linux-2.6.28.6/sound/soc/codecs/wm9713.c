@@ -1030,7 +1030,7 @@ static int ac97_aux_prepare(struct snd_pcm_substream *substream)
 	 SNDRV_PCM_FORMAT_S24_LE)
 
 struct snd_soc_dai wm9713_dai[] = {
-	{
+{
 	.name = "AC97 HiFi",
 	.type = SND_SOC_DAI_AC97_BUS,
 	.playback = {
@@ -1086,7 +1086,8 @@ struct snd_soc_dai wm9713_dai[] = {
 		.set_clkdiv = wm9713_set_dai_clkdiv,
 		.set_pll = wm9713_set_dai_pll,
 		.set_fmt = wm9713_set_dai_fmt,
-		.set_tristate = wm9713_set_dai_tristate,},
+		.set_tristate = wm9713_set_dai_tristate,
+	},
 	},
 };
 EXPORT_SYMBOL_GPL(wm9713_dai);
