@@ -363,19 +363,22 @@ static int s3c6400_ac97_hifi_prepare(struct snd_pcm_substream *substream)
 	s3cdbg("Entered %s\n", __FUNCTION__);
 //	printk("Entered %s\n", __FUNCTION__);
 
+	//the four lines below is for audio power manager
 	s3c6400_ac97_write(0,0x26,0x0);// enable output PGAs, Interal Clock, AC-Link, Analogue, Input PGAs and Mixers, Stereo DAC, Stereo ADC and Record mux
 	s3c6400_ac97_write(0, 0x0c, 0x0808);//no mute DAC to headphone,speaker and mono; DACLVOL and DACRVOL 0dB
 	s3c6400_ac97_write(0,0x3c, 0xf803);//enable VREF, PLL, DACL,DACR, ADCL,ADCR,HPLX,HPRX
-	s3c6400_ac97_write(0,0x3e,0xb990);
+	s3c6400_ac97_write(0,0x3e,0xb990);//enable MIC Bias, HPL PGA, HPR PGA, LINEL PGA, LINER PGA, MICA PGA, MICB PGA, MIC Pre-amp MPA, MIC Pre-amp MPB 
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-		s3c6400_ac97_write(0,0x02, 0x0404);
-		s3c6400_ac97_write(0, 0x04, 0x0606);	
-		s3c6400_ac97_write(0,0x1c, 0x12aa);
+		//for play
+		s3c6400_ac97_write(0,0x02, 0x0404);//no mute SPKL and SPKR
+		s3c6400_ac97_write(0, 0x04, 0x0606);//no mute HPL and HPR	
+		s3c6400_ac97_write(0,0x1c, 0x12aa);//mono->VMID, SPKL->HPMIXL, SPKR->HPMIXR, HPL->HPMIXL, HPR->HPMIXR, OUT3->INV1, OUT4->INV2
 	}
 	else
 	{
-		s3c6400_ac97_write(0, 0x12, 0x0f0f);
+		//for record
+		s3c6400_ac97_write(0, 0x12, 0x0f0f);//no mute audio ADC input(L&R) , RECVOLL and RECVOLR= 22.5dB
 #ifdef CONFIG_SOUND_WM9713_INPUT_STREAM_MIC
 		s3c6400_ac97_write(0,0x5c,0x2);//Slot 6 and Slot 9
 
@@ -388,7 +391,7 @@ static int s3c6400_ac97_hifi_prepare(struct snd_pcm_substream *substream)
 		s3c6400_ac97_write(0,0x10,val_ctl_mic_routing);
 
 
-		s3c6400_ac97_write(0,0x14,0xfe00);//mute headphone , mute mono and select mic(L and R)
+		s3c6400_ac97_write(0,0x14,0xfe00);//mute headphone , mute mono and select MICA(L and R)
 #else /* Input Stream is LINE-IN */
 		s3c6400_ac97_write(0, 0x14, 0xd612);//mute headphone , mute mono and select LINEL(L and R)
 #endif
